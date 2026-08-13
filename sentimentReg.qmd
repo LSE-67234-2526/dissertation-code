@@ -1,0 +1,693 @@
+
+# This file has code for the statistical analysis done on the sentiment analysis
+
+```{r}
+library("dplyr")
+```
+
+
+```{r}
+data = read.csv("")
+```
+
+
+```{r}
+data_filtered = data |> select(country, period, outlet, sentence, doc_id, headline, Name, p_pos, p_neg, year, topic)
+```
+
+## Article Count by Outlet and Period
+```{r}
+library(ggplot2)
+count_by_period = data_filtered |> 
+  group_by(outlet, period) |> 
+  summarise(n = n(), .groups = "drop") |> 
+  mutate(period = factor(period, levels = c("Pre", "Post"))) |>
+  ggplot(aes(x = period, y = n, fill = outlet)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Article Count by Outlet and Period",
+       y = "Total count of articles in subset",
+       x = "Period")  + geom_vline(xintercept = 1.5, linetype = "dashed", color = "gray50") 
+```
+
+```{r}
+ggsave("figure_name.png", plot = my_plot, 
+       width = 8, height = 5, dpi = 300)
+```
+
+## Summary metrics: topics were 0, 1, 2, 3, 4
+
+```{r}
+data_filtered |> head()
+```
+
+```{r}
+library(dplyr)
+
+art <- data_filtered |>
+  mutate(is_neg = as.integer(p_neg > 0.5)) |>
+  group_by(doc_id, outlet, country, period, Name, year) |>
+  summarise(
+    n_sent   = n(),
+    n_neg    = sum(is_neg),
+    prop_neg = n_neg / n_sent,
+    mean_pneg = mean(p_neg),        
+    .groups = "drop"
+  ) |>
+  filter(n_sent >= 3) |>
+  mutate(
+    period = relevel(factor(period), ref = "Pre"),
+    outlet = factor(outlet)
+  ) |> mutate(prop_pos = 1 - prop_neg)
+```
+
+```{r}
+d <- art |>
+  filter(Name == "1_AI in Art and Writing",
+         outlet %in% c("FT", "WSJ")) |>
+  mutate(outlet = relevel(factor(outlet), ref = "FT"))  
+m <- glm(prop_neg ~ period * outlet,
+         family = quasibinomial(link = "logit"),
+         weights = n_sent,
+         data = d)
+```
+
+```{r}
+library(purrr); library(broom)
+
+pairs <- list(c("Guardian","NYT"), c("FT","WSJ"), c("Sun","NYPost"))
+
+res <- map_dfr(pairs, function(p) {
+  map_dfr(unique(art$Name), function(tp) {
+    d <- art |>
+      filter(Name == tp, outlet %in% p) |>
+      mutate(outlet = relevel(factor(outlet), ref = p[1]))
+
+    if (n_distinct(d$outlet) < 2 || n_distinct(d$period) < 2) return(NULL)
+
+    glm(prop_neg ~ period * outlet,
+        family = quasibinomial(link = "logit"),
+        weights = n_sent, data = d) |>
+      tidy() |>
+      filter(grepl(":", term)) |>
+      mutate(topic = tp, pair = paste(p, collapse = "-"))
+  })
+}) |>
+  mutate(p_bh = p.adjust(p.value, method = "BH"))
+```
+
+```{r}
+library("ggplot2")
+plot_dat <- art |>
+  group_by(Name, outlet, country, period) |>
+  summarise(prop_pos = weighted.mean(prop_pos, n_sent), .groups = "drop") |>
+  mutate(period = factor(period, levels = c("Pre", "Post")))
+
+ggplot(plot_dat, aes(period, prop_pos, group = outlet, colour = country)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  ggrepel::geom_text_repel(
+    data = ~ filter(.x, period == "Post"),
+    aes(label = outlet), size = 2.8, direction = "y", nudge_x = 0.15, hjust = 0
+  ) +
+  facet_wrap(~ Name, ncol = 4, labeller = label_wrap_gen(28)) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_colour_manual(values = c(UK = "#1B4965", US = "#C1666B")) +
+  labs(x = NULL, y = "Positive sentences (%)", colour = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold", size = 7.5))
+```
+
+```{r}
+pair_order <- c("FT", "WSJ", "Sun", "NP", "Guardian", "NYTimes")  # adjust to your exact strings
+
+plot_dat <- art |>
+  group_by(Name, outlet, country, period) |>
+  summarise(prop_pos = weighted.mean(1 - prop_neg, n_sent), .groups = "drop") |>
+  mutate(
+    outlet = factor(outlet, levels = rev(pair_order)),   # rev() so FT lands on top
+    period = factor(period, levels = c("Pre", "Post"))
+  )
+
+ggplot(plot_dat, aes(prop_pos, outlet, fill = period)) +
+geom_col(position = position_dodge(0.9), width = 0.9) +
+  geom_hline(yintercept = c(2.5, 4.5), colour = "grey75", linewidth = 0.3) +
+  facet_wrap(~ Name, ncol = 4, labeller = label_wrap_gen(28)) +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1),
+                     breaks = c(0, 0.5, 1), expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = c(Pre = "#9DB4C0", Post = "#1B4965")) +
+  labs(x = "Positive sentences (%)", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold", size = 7.5),
+        legend.position = "top") +  facet_wrap(~ Name, ncol = 2, labeller = label_wrap_gen(28))
+```
+
+```{r}
+pair_order <- c("FT", "WSJ", "Guardian", "NYTimes")
+
+yr <- art |>
+  filter(outlet %in% pair_order) |> filter(year > 2019) |>
+  group_by(outlet, year) |> 
+  summarise(
+    n_art    = n(),
+    prop_pos = weighted.mean(1 - prop_neg, n_sent),
+    .groups  = "drop"
+  ) |>
+  mutate(prop_pos = ifelse(n_art < 5, NA, prop_pos))
+
+
+  ggplot(yr, aes(factor(year), forcats::fct_rev(factor(outlet, levels = pair_order)))) +
+  geom_tile(aes(fill = prop_pos), colour = "white", linewidth = 0) +
+  geom_text(aes(label = n_art), size = 2.2, colour = "white") +
+  geom_vline(xintercept = 3.5, linewidth = 0.7, colour = "grey20") +
+  scale_fill_gradient2(low = "#C1666B", mid = "#F2F0EB", high = "#1B4965",
+                       midpoint = 0.5, limits = c(0.45, 0.67),
+                       oob = scales::squish,
+                       labels = scales::percent, name = "Positive") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_text(hjust = 0))
+```
+
+```{r}
+yr |>
+  mutate(pair = ifelse(outlet %in% c("FT","Guardian"), "FT-Guardian", "WSJ-NYT")) |>
+  ggplot(aes(year, prop_pos, colour = outlet)) +
+  geom_line() + geom_point(aes(size = n_art)) +
+  facet_wrap(~ pair) + theme_minimal()
+```
+
+## DID REGRESSION FOR APPENDIX
+
+```{r}
+library(dplyr); library(broom); library(sandwich); library(lmtest); library(emmeans)
+
+art <- data_filtered |> filter(outlet != "Sun") |> filter(outlet != "NP") |>
+  group_by(doc_id, outlet, country, period, year) |>
+  summarise(mean_pos = mean(p_pos),
+            n_sent   = n(),
+            .groups  = "drop") |>
+  mutate(period = factor(period, levels = c("Pre", "Post")),
+         outlet = factor(outlet),
+         year   = as.integer(year))
+
+
+fit_pair <- function(df, o1, o2) {
+  d <- df |>
+    filter(outlet %in% c(o1, o2)) |>
+    mutate(outlet = relevel(droplevels(outlet), ref = o1))
+  glm(mean_pos ~ period * outlet, data = d,
+      family = quasibinomial(link = "logit"), weights = n_sent)
+}
+
+m_ft_wsj  <- fit_pair(art, "FT", "WSJ")
+m_gua_nyt <- fit_pair(art, "Guardian", "NYTimes")
+m_wsj_nyt <- fit_pair(art, "WSJ", "NYTimes")
+m_ft_gua  <- fit_pair(art, "FT", "Guardian")
+
+models <- list(FT_vs_WSJ = m_ft_wsj, Guardian_vs_NYT = m_gua_nyt,
+               WSJ_vs_NYT = m_wsj_nyt, FT_vs_Guardian = m_ft_gua)
+
+results <- purrr::imap_dfr(models, \(m, nm)
+  tidy(m, conf.int = TRUE) |> mutate(pair = nm, .before = 1))
+
+
+
+results_did <- results |> filter(term |> stringr::str_detect("^period.*outlet"))
+
+p_adj_df <- tibble(
+  pair = results_did$pair,
+  term = results_did$term,
+  p.value_adj = p.adjust(results_did$p.value, method = "BH")
+)
+
+results <- results |> 
+  left_join(p_adj_df, by = c("pair", "term")) |>
+  mutate(p.value_adj = coalesce(p.value_adj, p.value))
+
+
+results |> 
+  select(pair, term, estimate, conf.low, conf.high, p.value, p.value_adj) |>
+  knitr::kable(digits = 4) |>
+  kableExtra::kable_styling()
+```
+
+
+```{r}
+
+m_pool <- glm(mean_pos ~ period * outlet, data = art,
+              family = quasibinomial(link = "logit"), weights = n_sent)
+  
+
+
+
+emm_did <- emmeans(m_pool, ~ period | outlet) |> contrast("revpairwise")
+contrast(emm_did, "revpairwise", by = NULL, adjust = "BH")
+
+
+m_country <- glm(mean_pos ~ period * country, data = art,
+                 family = quasibinomial(link = "logit"), weights = n_sent)
+
+
+m_trend <- glm(mean_pos ~ year * outlet, data = filter(art, period == "Pre"),
+               family = quasibinomial(link = "logit"), weights = n_sent)
+
+emm <- emmeans(m_pool, ~ outlet | period)
+pairs(emm, adjust = "BH")     
+emmeans(m_trend, ~ outlet | year, type = "response")
+
+art |>
+  group_by(outlet, year) |>
+  summarise(n = n(), pos = weighted.mean(mean_pos, n_sent),
+            se = sd(mean_pos)/sqrt(n()), .groups = "drop") |>
+  ggplot(aes(year, pos, colour = outlet)) +
+  geom_pointrange(aes(ymin = pos - 1.96*se, ymax = pos + 1.96*se)) +
+ geom_line() + geom_point() +
+  geom_vline(xintercept = 2022.9, linetype = "dashed") +
+  labs(y = "Weighted Mean of the Assigned Probability of Positive Sentiment", title = "Positive Sentiment by Outlet and Year")
+```
+
+
+
+
+```{r}
+library(emmeans)
+
+art <- art |> mutate(year_f = factor(year))
+
+m_year <- glm(mean_pos ~ outlet * year_f, data = art,
+              family = quasibinomial(link = "logit"), weights = n_sent)
+
+emm_df <- emmeans(m_year, ~ outlet | year_f, type = "response") |>
+  as_tibble() |>
+  mutate(year = as.integer(as.character(year_f)))
+
+ggplot(emm_df, aes(year, prob, colour = outlet)) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL),
+                  position = position_dodge(width = 0.3)) +
+  geom_line(position = position_dodge(width = 0.3)) +
+  geom_vline(xintercept = 2022.9, linetype = "dashed") +
+  labs(y = "Weighted Mean of the Predicted Probability of Positive Sentiment", title = "Positive Sentiment by Outlet and Year")
+```
+
+```{r}
+art <- art |> 
+  mutate(year_f = relevel(factor(year), ref = "2022"))
+
+es_pair <- function(df, o1, o2) {
+  d <- df |>
+    filter(outlet %in% c(o1, o2)) |>
+    mutate(outlet = relevel(droplevels(factor(outlet)), ref = o1))
+  glm(mean_pos ~ year_f * outlet, data = d,
+      family = quasibinomial(link = "logit"), weights = n_sent)
+}
+
+es_models <- list(
+  FT_vs_WSJ       = es_pair(art, "FT", "WSJ"),
+  Guardian_vs_NYT = es_pair(art, "Guardian", "NYTimes"),
+  WSJ_vs_NYT      = es_pair(art, "WSJ", "NYTimes"),
+  FT_vs_Guardian  = es_pair(art, "FT", "Guardian")
+)
+
+
+es_df <- purrr::imap_dfr(es_models, \(m, nm)
+  broom::tidy(m, conf.int = TRUE) |>
+    filter(grepl("^year_f.*:outlet", term)) |>
+    mutate(pair = nm,
+           year = as.integer(stringr::str_extract(term, "\\d{4}"))))
+
+es_df <- bind_rows(
+  es_df,
+  tibble(pair = names(es_models), year = 2022,
+         estimate = 0, conf.low = 0, conf.high = 0)
+)
+
+ggplot(es_df, aes(year, estimate)) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_vline(xintercept = 2022.9, linetype = "dashed") +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high)) +
+  facet_wrap(~ pair) +
+  labs(y = "DiD estimate (log-odds, relative to 2022)",
+       x = "year",
+       title = "Event study: outlet sentiment gaps by year")
+```
+
+```{r}
+
+art <- art |> mutate(year_f = relevel(factor(year), ref = "2021"))
+
+
+base_check <- purrr::map_dfr(c("2020", "2021", "2022"), \(b) {
+  a <- art |> mutate(year_f = relevel(factor(year), ref = b))
+  es_pair(a, "FT", "WSJ") |> broom::tidy(conf.int = TRUE) |>
+    filter(grepl("^year_f.*:outlet", term)) |> mutate(base = b)
+})
+```
+
+## REFERENCE YEAR ROBUSTNESS CHECK
+```{r}
+library(dplyr); library(ggplot2); library(broom); library(purrr); library(stringr)
+
+
+art <- data_filtered |>
+  group_by(doc_id, outlet, country, period, year) |>
+  summarise(mean_pos = mean(p_pos),
+            n_sent   = n(),
+            .groups  = "drop") |>
+  mutate(year   = as.integer(year),
+         year_f = relevel(factor(year), ref = "2021"),   # 2021 = last "normal" pre year
+         period = factor(period, levels = c("Pre", "Post")))
+
+
+es_pair <- function(df, o1, o2) {
+  d <- df |>
+    filter(outlet %in% c(o1, o2)) |>
+    mutate(outlet = relevel(droplevels(factor(outlet)), ref = o1),
+           year_f = droplevels(year_f))
+  glm(mean_pos ~ year_f * outlet, data = d,
+      family = quasibinomial(link = "logit"), weights = n_sent)
+}
+
+pairs_list <- list(
+  FT_vs_WSJ       = c("FT", "WSJ"),
+  Guardian_vs_NYT = c("Guardian", "NYTimes"),
+  WSJ_vs_NYT      = c("WSJ", "NYTimes"),
+  FT_vs_Guardian  = c("FT", "Guardian")
+)
+
+
+get_es <- function(df, base) {
+  d <- df |> mutate(year_f = relevel(factor(year), ref = base))
+  imap_dfr(pairs_list, \(o, nm) {
+    m <- es_pair(d, o[1], o[2])
+    tidy(m, conf.int = TRUE) |>
+      filter(str_detect(term, "^year_f.*:outlet")) |>
+      mutate(pair = nm,
+             year = as.integer(str_extract(term, "\\d{4}")),
+             base = base)
+  }) |>
+    bind_rows(tibble(pair = names(pairs_list), year = as.integer(base),
+                     estimate = 0, conf.low = 0, conf.high = 0, base = base))
+}
+
+es_df <- get_es(art, "2021")
+
+
+p_es <- ggplot(es_df, aes(year, estimate)) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_vline(xintercept = 2022.92, linetype = "dashed") +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high)) +
+  facet_wrap(~ pair) +
+  scale_x_continuous(breaks = sort(unique(es_df$year))) +
+  labs(y = "DiD estimate (log-odds, relative to 2021)", x = "Year",
+       title = "Event study: outlet sentiment gaps by year",
+       subtitle = "Reference year 2021; dashed line marks ChatGPT release (Nov 2022)") +
+  theme_minimal(base_size = 11)
+
+p_es
+
+
+es_robust <- map_dfr(c("2020", "2021", "2022"), \(b) get_es(art, b))
+
+ggplot(es_robust, aes(year, estimate, colour = base, shape = base)) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_vline(xintercept = 2022.92, linetype = "dashed") +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high),
+                  position = position_dodge(width = 0.5)) +
+  facet_wrap(~ pair) +
+  scale_x_continuous(breaks = sort(unique(es_robust$year))) +
+  labs(y = "DiD estimate (log-odds)", x = "Year", colour = "Year", shape = "Year",
+       title = "Event Study Sensitivity to Reference Year") +
+  theme_minimal(base_size = 11)
+
+
+did_pair <- function(o1, o2) {
+  d <- art |>
+    filter(outlet %in% c(o1, o2)) |>
+    mutate(outlet = relevel(droplevels(factor(outlet)), ref = o1))
+  glm(mean_pos ~ period * outlet, data = d,
+      family = quasibinomial(link = "logit"), weights = n_sent)
+}
+did_models <- map(pairs_list, \(o) did_pair(o[1], o[2]))
+
+did_tab <- imap_dfr(did_models, \(m, nm)
+  tidy(m, conf.int = TRUE) |>
+    filter(str_detect(term, ":")) |>
+    mutate(pair = nm, dispersion = summary(m)$dispersion)) |>
+  mutate(p_adj = p.adjust(p.value, "BH"))
+
+did_tab 
+```
+
+## MAIN EVENT STUDY FOR FINAL PAPER
+```{r}
+library(dplyr); library(ggplot2); library(broom); library(purrr); library(stringr)
+
+
+art <- data_filtered |>
+  group_by(doc_id, outlet, country, period, year) |>
+  summarise(mean_pos = mean(p_pos),
+            n_sent   = n(),
+            .groups  = "drop") |>
+  mutate(year   = as.integer(year),
+         period = factor(period, levels = c("Pre", "Post")))
+
+
+es_pair <- function(df, o1, o2) {
+  d <- df |>
+    filter(outlet %in% c(o1, o2)) |>
+    mutate(outlet = relevel(droplevels(factor(outlet)), ref = o1),
+           year_f = droplevels(year_f))
+  glm(mean_pos ~ year_f * outlet, data = d,
+      family = quasibinomial(link = "logit"), weights = n_sent)
+}
+
+pairs_list <- list(
+  FT_vs_WSJ       = c("FT", "WSJ"),
+  Guardian_vs_NYT = c("Guardian", "NYTimes"),
+  WSJ_vs_NYT      = c("WSJ", "NYTimes"),
+  FT_vs_Guardian  = c("FT", "Guardian")
+)
+
+get_es <- function(df, base) {
+  d <- df |> mutate(year_f = relevel(factor(year), ref = base))
+  imap_dfr(pairs_list, \(o, nm) {
+    m <- es_pair(d, o[1], o[2])
+    tidy(m, conf.int = TRUE) |>
+      filter(str_detect(term, "^year_f.*:outlet")) |>
+      mutate(pair = nm,
+             year = as.integer(str_extract(term, "\\d{4}")),
+             base = base)
+  }) |>
+    bind_rows(tibble(pair = names(pairs_list), year = as.integer(base),
+                     estimate = 0, conf.low = 0, conf.high = 0, base = base))
+}
+
+
+es_2022 <- get_es(art, "2022")
+
+ggplot(es_2022, aes(year, estimate)) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_vline(xintercept = 2022.92, linetype = "dashed") +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high)) +
+  facet_wrap(~ pair) +
+  scale_x_continuous(breaks = sort(unique(es_2022$year))) +
+  labs(y = "DiD estimate (log-odds relative to 2022 baseline)", x = "Year",
+       title = "Event study of Sentiment Gaps between Outlets by year") +
+  theme_minimal(base_size = 11)
+```
+
+
+## OPTIONAL WORD CLOUDS: To digger deeper into each topic, I had made word clouds for every outletxperiodxtopic pair
+
+
+
+```{r}
+library(quanteda)
+library(tidyverse)
+install.packages("quanteda.textplots")
+library(quanteda.textplots)
+
+data_filtered %>% filter(outlet != "Sun") |> filter(outlet != "NP") |> 
+  group_by(outlet, period, Name) %>%
+  nest() %>%
+  pwalk(function(outlet, period, Name, data) {
+    toks <- tokens(data$sentence, tolower = TRUE, remove_punct = TRUE) |>  tokens_remove(c(stopwords("english"), "ai")) 
+    mat <- dfm(toks)
+    
+    filename <- paste0("wordcloud_", outlet, "_", period, "_T", Name, ".png")
+    png(filename, width = 800, height = 600)
+    textplot_wordcloud(mat, max_words = 100)
+    title(paste(outlet, "|", period, "|", "Topic", Name))
+    dev.off()
+    
+    cat("✓", filename, "\n")
+  })
+```
+
+
+
+```{r}
+library(tidyverse)
+library(quanteda)
+library(quanteda.textplots)
+
+data_filtered %>%
+  group_by(Name) %>%
+  nest() %>%
+  pwalk(function(Name, data) {
+    toks <- tokens(data$sentence, tolower = TRUE, remove_punct = TRUE) %>%
+      tokens_remove(c(stopwords("english"), "ai"))
+    mat <- dfm(toks)
+    
+    if (nfeat(mat) < 5) {
+      cat("SKIP: T", topic, "- too sparse\n")
+      return()
+    }
+    
+    cat("\nTopic", topic, "\n")
+    textplot_wordcloud(mat, max_words = 100, min_count = 1)
+  })
+```
+
+
+```{r}
+library(tidyverse)
+library(quanteda)
+library(quanteda.textplots)
+library(gridExtra)
+
+for (per in c("pre", "post")) {
+  outlets_list <- data_filtered %>% filter(period == per) |> filter(outlet != "Sun") |> filter(outlet != "NP") %>% pull(outlet) %>% unique()
+  
+  plots <- map(outlets_list, function(out) {
+    toks <- data_filtered %>%
+      filter(period == per, outlet == out) %>%
+      pull(sentence) %>%
+      tokens(tolower = TRUE, remove_punct = TRUE) %>%
+      tokens_remove(c(stopwords("english"), "ai"))
+    
+    mat <- dfm(toks)
+    
+    if (nfeat(mat) < 5) {
+      return(NULL)
+    }
+    
+    textplot_wordcloud(mat, max_words = 100, min_count = 1) +
+      ggtitle(out)
+  })
+  
+  plots <- discard(plots, is.null)
+  grid.arrange(grobs = plots, ncol = 2, top = per)
+}
+```
+
+
+```{r}
+library(tidyverse)
+library(quanteda)
+library(quanteda.textplots)
+
+for (per in c("pre", "post")) {
+  cat("\n========== PERIOD:", per, "==========\n")
+  
+  outlet_list <- c("WSJ", "FT", "NYTimes", "Guardian")
+  topic_list <- unique(data_filtered$Name)
+  
+  for (out in outlet_list) {
+    for (top in topic_list) {
+      toks <- data_filtered %>%
+        filter(period == per, outlet == out, topic == top) %>%
+        pull(sentence) %>%
+        tokens(tolower = TRUE, remove_punct = TRUE) %>%
+        tokens_remove(c(stopwords("english"), "ai"))
+      
+      mat <- dfm(toks)
+      
+      if (nfeat(mat) < 3) {
+        cat("SKIP:", out, "|", top, "- too sparse\n")
+        next
+      }
+      
+      cat("\n", out, "|", top, "\n")
+      
+      tryCatch({
+        textplot_wordcloud(mat, max_words = 50, min_count = 1)
+      }, error = function(e) {
+        cat("ERROR plotting:", out, "|", top, "\n")
+      })
+    }
+  }
+}
+```
+
+
+```{r}
+library(tidyverse)
+library(quanteda)
+library(quanteda.textplots)
+library(gridExtra)
+
+for (per in c("pre", "post")) {
+  plots <- data_filtered %>%
+    filter(period == per) %>%
+    group_by(outlet, period, Name) %>%
+    nest() %>%
+    pmap(function(outlet, period, Name, data) {
+      toks <- tokens(data$sentence, tolower = TRUE, remove_punct = TRUE) %>%
+        tokens_remove(c(stopwords("english"), "ai"))
+      mat <- dfm(toks)
+      
+      if (nfeat(mat) < 5) {
+        return(NULL)
+      }
+      
+      p <- recordPlot()
+      textplot_wordcloud(mat, max_words = 100, min_count = 1)
+      p <- recordPlot()
+      
+      return(p)
+    }) %>%
+    discard(is.null)
+  
+  if (length(plots) > 0) {
+    grid.arrange(grobs = plots, ncol = 5, top = paste("Period:", per))
+  }
+}
+```
+
+
+```{r}
+library(tidyverse)
+library(quanteda)
+library(quanteda.textplots)
+
+for (per in c("pre", "post")) {
+  dir.create(paste0("wordclouds_", per), showWarnings = FALSE)
+  
+  data_filtered %>%
+    filter(period == per) %>%
+    group_by(outlet, period, Name) %>%
+    nest() %>%
+    pwalk(function(outlet, period, Name, data) {
+      toks <- tokens(data$sentence, tolower = TRUE, remove_punct = TRUE) %>%
+        tokens_remove(c(stopwords("english"), "ai"))
+      mat <- dfm(toks)
+      
+      if (nfeat(mat) < 5) {
+        return()
+      }
+      
+      filename <- paste0("wordclouds_", per, "/", outlet, "_", Name, ".png")
+      png(filename, width = 600, height = 500)
+      textplot_wordcloud(mat, max_words = 100, min_count = 1)
+      title(paste(outlet, "|", Name))
+      dev.off()
+      
+      cat("Saved:", filename, "\n")
+    })
+}
+```

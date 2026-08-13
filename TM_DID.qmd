@@ -1,0 +1,1408 @@
+
+```{r}
+#| results: hide
+library("dplyr")
+library(quanteda)
+library(cld2)
+library(readtext)
+library(stringr)
+library("quanteda.textstats")
+library(purrr)
+library(rsvd)
+library(Rtsne)
+library(geometry)
+library(modelsummary)
+library(tidyverse)
+library(stm)
+library(quanteda.textplots)
+library(logistf)
+library(tidytext)
+```
+
+## Read in Data
+```{r}
+#add dates back into the data 
+data = read.csv("")
+```
+
+```{r}
+topic_info =  read.csv("") 
+```
+
+```{r}
+#removing topics that were gibberish
+data_cleaner = data |> filter(!(topic %in% c(-1))) |> select(-Unnamed..0)
+#This decreased row count from 211335 to 93688
+```
+
+## Topic Names 
+
+```{r}
+topic_labels = topic_info |> select(Topic, Name)
+```
+
+```{r}
+#merge with names 
+full_data = data_cleaner %>% left_join(topic_labels, by = c("topic" = "Topic")) |> rename(topic_number = topic) |> rename(topic_name = Name)
+```
+
+```{r}
+full_data %>%
+  count(doc_id, topic_number) %>%
+  group_by(doc_id) |>  mutate(prop = n / sum(n))
+```
+
+
+```{r}
+# Convert article level 
+# 1. build topic proportions (doc_id + topic_* columns only)
+topic_props <- full_data %>%
+  count(doc_id, topic_number) %>%
+  group_by(doc_id) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  select(doc_id, topic_number, prop) %>%
+  complete(doc_id, topic_number, fill = list(prop = 0)) %>%
+  pivot_wider(names_from = topic_number, values_from = prop, names_prefix = "topic_")
+
+# 2. build article-level metadata (one row per doc_id, all your other columns)
+article_meta <- full_data %>%
+  group_by(doc_id) %>%
+  summarise(across(-c(sentence), first), .groups = "drop") 
+
+# 3. join them
+article_df <- article_meta %>%
+  left_join(topic_props, by = "doc_id")
+
+head(article_df)
+```
+
+```{r}
+library(tidyverse)
+
+data_longer <- article_df |> select(-topic_label) |>
+  pivot_longer(
+  cols = starts_with("topic_") & !matches("^topic_name$"),
+   names_to = "category",
+  values_to = "proportion" )
+
+head(data_longer)
+```
+
+
+## Pair wise datasets 
+
+```{r}
+#Newspapers
+sun_npost = article_df |> filter(outlet %in% c("Sun", "NP")) |> 
+  mutate(period = relevel(factor(period), ref = "Pre")) |>  mutate(outlet = relevel(factor(outlet), ref = "Sun"))
+
+guardian_times = article_df |> filter(outlet %in% c("Guardian", "NYTimes")) |> 
+  mutate(period = relevel(factor(period), ref = "Pre"))
+
+ft_wsj = article_df |> filter(outlet %in% c("FT", "WSJ")) |> 
+  mutate(period = relevel(factor(period), ref = "Pre"))
+
+#Countries 
+full_pre_reference = article_df |>
+  mutate(period = relevel(factor(period), ref = "Pre"))
+```
+
+```{r}
+
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(sandwich)
+library(lmtest)
+
+sun_full    <- full_pre_reference |> filter(outlet == "Sun")
+npost_full  <- full_pre_reference |> filter(outlet == "NP")
+
+
+check_separation <- function(data, topic_col) {
+  data |>
+    group_by(period) |>
+    summarise(n_nonzero = sum(.data[[topic_col]] > 0, na.rm = TRUE), .groups = "drop") |>
+    pull(n_nonzero) |>
+    min() 
+}
+
+separation_flags <- tibble(
+  topic = 0:13,
+  min_nonzero_sun = sapply(0:13, function(i) check_separation(sun_full, paste0("topic_", i))),
+  min_nonzero_np  = sapply(0:13, function(i) check_separation(npost_full, paste0("topic_", i)))
+) |>
+  mutate(
+    needs_lpm_sun = min_nonzero_sun <= 2,   
+    needs_lpm_np  = min_nonzero_np  <= 2
+  )
+
+print(separation_flags)
+
+
+models_sun <- list()
+models_np  <- list()
+
+for (i in 0:13) {
+  f <- as.formula(paste0("topic_", i, " ~ period"))
+
+  use_lpm_sun <- separation_flags$needs_lpm_sun[separation_flags$topic == i]
+  use_lpm_np  <- separation_flags$needs_lpm_np[separation_flags$topic == i]
+
+  models_sun[[paste0("topic", i, "_sun")]] <- if (use_lpm_sun) {
+    lm(f, data = sun_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = sun_full)
+  }
+
+  models_np[[paste0("topic", i, "_np")]] <- if (use_lpm_np) {
+    lm(f, data = npost_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = npost_full)
+  }
+}
+
+
+get_period_estimates <- function(model, outlet_label) {
+  periods <- c("Pre", "Post")
+
+  if (inherits(model, "lm") && !inherits(model, "glm")) {
+    ## LINEAR PROBABILITY MODEL PATH (robust SEs)
+    robust_vcov <- vcovHC(model, type = "HC1")
+    b <- coef(model)
+
+  
+    est_pre  <- b[1]
+    est_post <- b[1] + b[2]
+
+    ci_pre  <- coefci(model, vcov. = robust_vcov)[1, ]
+
+
+    data_post_ref <- model$model |>
+      mutate(period = relevel(factor(period), ref = "Post"))
+    f_post <- formula(model)
+    model_post_ref <- lm(f_post, data = data_post_ref)
+    ci_post <- coefci(model_post_ref, vcov. = vcovHC(model_post_ref, type = "HC1"))[1, ]
+
+    tibble(
+      outlet    = outlet_label,
+      period    = periods,
+      estimate  = c(est_pre, est_post),
+      conf.low  = c(ci_pre[1], ci_post[1]),
+      conf.high = c(ci_pre[2], ci_post[2])
+    )
+
+  } else {
+    ## QUASIBINOMIAL GLM PATH
+    pred <- predict(model, newdata = data.frame(period = periods),
+                     type = "link", se.fit = TRUE)
+    tibble(
+      outlet    = outlet_label,
+      period    = periods,
+      estimate  = plogis(pred$fit),
+      conf.low  = plogis(pred$fit - 1.96 * pred$se.fit),
+      conf.high = plogis(pred$fit + 1.96 * pred$se.fit)
+    )
+  }
+}
+
+
+
+n_df <- bind_rows(
+  sun_full   |> count(period) |> mutate(outlet = "Sun"),
+  npost_full |> count(period) |> mutate(outlet = "NP")
+)
+
+topic_graphs   <- list()
+topic_plot_dfs <- list()
+
+for (i in 0:13) {
+  sun_model   <- models_sun[[paste0("topic", i, "_sun")]]
+  npost_model <- models_np[[paste0("topic", i, "_np")]]
+
+  if (is.null(sun_model) || is.null(npost_model)) {
+    warning(paste("Missing model for topic", i, "- skipping"))
+    next
+  }
+
+  plot_df <- bind_rows(
+    get_period_estimates(sun_model, "Sun"),
+    get_period_estimates(npost_model, "NP")
+  ) |> left_join(n_df, by = c("period", "outlet"))
+
+  g <- ggplot(plot_df, aes(x = period, y = estimate, group = outlet, color = outlet)) +
+    geom_line(linewidth = 1.3, alpha = 0.85) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+    geom_point(size = 5) +
+    scale_color_manual(
+      name = "Outlet",
+      values = c(Sun = "#B22222", NP = "#1B4F72"),
+      labels = c(Sun = "The Sun", NP = "The New York Post")
+    ) +
+    scale_x_discrete(limits = c("Pre", "Post"),
+                      labels = c(Pre = "Pre-ChatGPT", Post = "Post-ChatGPT")) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = paste0("Topic ", i, " coverage: The Sun vs New York Post"),
+      subtitle = "Topic proportion, pre vs post ChatGPT launch (Nov 2022)",
+      x = NULL, y = "Share of Mentions across Articles"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+
+  topic_plot_dfs[[paste0("topic", i)]] <- plot_df
+  topic_graphs[[paste0("topic", i)]]   <- g
+}
+
+
+
+all_plot_df <- bind_rows(topic_plot_dfs, .id = "topic") |>
+  mutate(
+    period      = factor(period, levels = c("Pre", "Post")),
+    topic_num   = as.integer(gsub("topic", "", topic)),
+    topic_label = factor(paste0("Topic ", topic_num), levels = paste0("Topic ", 0:13))
+  )
+
+facet_sun= facet_graph <- ggplot(all_plot_df, aes(x = period, y = estimate, group = outlet, color = outlet)) +
+  geom_line(linewidth = 1, alpha = 0.85) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+  geom_point(size = 2.5) +
+  scale_color_manual(
+    name = "Outlet",
+    values = c(Sun = "#B22222", NP = "#1B4F72"),
+    labels = c(Sun = "The Sun", NP = "New York Post")
+  ) +
+  scale_x_discrete(limits = c("Pre", "Post"),
+                    labels = c(Pre = "Pre-ChatGPT", Post = "Post-ChatGPT")) + scale_x_discrete(limits = c("Pre", "Post"), labels = c(Pre = "Pre", Post = "Post")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ topic_label, scales = "free", ncol = 4) +
+  labs(
+    title = "Topic coverage: The Sun vs New York Post",
+    subtitle = "Topic proportion, pre vs post ChatGPT launch (Nov 2022)",
+    x = NULL, y = "Share of Mentions across Articles"
+  ) + 
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "top",
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(size = 8)
+  )
+
+facet_graph
+```
+
+
+
+```{r}
+
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(sandwich)
+library(lmtest)
+
+guardian_full <- full_pre_reference |> filter(outlet == "Guardian")
+nyt_full      <- full_pre_reference |> filter(outlet == "NYTimes")
+
+
+check_separation <- function(data, topic_col) {
+  data |>
+    group_by(period) |>
+    summarise(n_nonzero = sum(.data[[topic_col]] > 0, na.rm = TRUE), .groups = "drop") |>
+    pull(n_nonzero) |>
+    min()
+}
+
+separation_flags_gn <- tibble(
+  topic = 0:13,
+  min_nonzero_guardian = sapply(0:13, function(i) check_separation(guardian_full, paste0("topic_", i))),
+  min_nonzero_nyt       = sapply(0:13, function(i) check_separation(nyt_full, paste0("topic_", i)))
+) |>
+  mutate(
+    needs_lpm_guardian = min_nonzero_guardian <= 2,
+    needs_lpm_nyt       = min_nonzero_nyt       <= 2
+  )
+
+print(separation_flags_gn)
+
+
+models_guardian <- list()
+models_nyt      <- list()
+
+for (i in 0:13) {
+  f <- as.formula(paste0("topic_", i, " ~ period"))
+
+  use_lpm_guardian <- separation_flags_gn$needs_lpm_guardian[separation_flags_gn$topic == i]
+  use_lpm_nyt       <- separation_flags_gn$needs_lpm_nyt[separation_flags_gn$topic == i]
+
+  models_guardian[[paste0("topic", i, "_guardian")]] <- if (use_lpm_guardian) {
+    lm(f, data = guardian_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = guardian_full)
+  }
+
+  models_nyt[[paste0("topic", i, "_nyt")]] <- if (use_lpm_nyt) {
+    lm(f, data = nyt_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = nyt_full)
+  }
+}
+
+
+
+get_period_estimates <- function(model, outlet_label) {
+  periods <- c("Pre", "Post")
+
+  if (inherits(model, "lm") && !inherits(model, "glm")) {
+    robust_vcov <- vcovHC(model, type = "HC1")
+    b <- coef(model)
+
+    est_pre  <- b[1]
+    est_post <- b[1] + b[2]
+
+    ci_pre <- coefci(model, vcov. = robust_vcov)[1, ]
+
+    data_post_ref <- model$model |>
+      mutate(period = relevel(factor(period), ref = "Post"))
+    f_post <- formula(model)
+    model_post_ref <- lm(f_post, data = data_post_ref)
+    ci_post <- coefci(model_post_ref, vcov. = vcovHC(model_post_ref, type = "HC1"))[1, ]
+
+    tibble(
+      outlet    = outlet_label,
+      period    = periods,
+      estimate  = c(est_pre, est_post),
+      conf.low  = c(ci_pre[1], ci_post[1]),
+      conf.high = c(ci_pre[2], ci_post[2])
+    )
+
+  } else {
+    pred <- predict(model, newdata = data.frame(period = periods),
+                     type = "link", se.fit = TRUE)
+    tibble(
+      outlet    = outlet_label,
+      period    = periods,
+      estimate  = plogis(pred$fit),
+      conf.low  = plogis(pred$fit - 1.96 * pred$se.fit),
+      conf.high = plogis(pred$fit + 1.96 * pred$se.fit)
+    )
+  }
+}
+
+
+
+n_df_gn <- bind_rows(
+  guardian_full |> count(period) |> mutate(outlet = "Guardian"),
+  nyt_full      |> count(period) |> mutate(outlet = "NYTimes")
+)
+
+topic_graphs_gn   <- list()
+topic_plot_dfs_gn <- list()
+
+for (i in 0:13) {
+  guardian_model <- models_guardian[[paste0("topic", i, "_guardian")]]
+  nyt_model      <- models_nyt[[paste0("topic", i, "_nyt")]]
+
+  if (is.null(guardian_model) || is.null(nyt_model)) {
+    warning(paste("Missing model for topic", i, "- skipping"))
+    next
+  }
+
+  plot_df <- bind_rows(
+    get_period_estimates(guardian_model, "Guardian"),
+    get_period_estimates(nyt_model, "NYTimes")
+  ) |> left_join(n_df_gn, by = c("period", "outlet"))
+
+  g <- ggplot(plot_df, aes(x = period, y = estimate, group = outlet, color = outlet)) +
+    geom_line(linewidth = 1.3, alpha = 0.85) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+    geom_point(size = 5) +
+    scale_color_manual(
+      name = "Outlet",
+      values = c(Guardian = "#B22222", NYTimes = "#1B4F72"),
+      labels = c(Guardian = "The Guardian", NYTimes = "The New York Times")
+    ) +
+    scale_x_discrete(limits = c("Pre", "Post"),
+                      labels = c(Pre = "Pre-ChatGPT", Post = "Post-ChatGPT")) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = paste0("Topic ", i, " coverage: The Guardian vs New York Times"),
+      subtitle = "Topic proportion, pre vs post ChatGPT launch (Nov 2022)",
+      x = NULL, y = "Share of Mentions across Articles"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+
+  topic_plot_dfs_gn[[paste0("topic", i)]] <- plot_df
+  topic_graphs_gn[[paste0("topic", i)]]   <- g
+}
+
+
+all_plot_df_gn <- bind_rows(topic_plot_dfs_gn, .id = "topic") |>
+  mutate(
+    period      = factor(period, levels = c("Pre", "Post")),
+    topic_num   = as.integer(gsub("topic", "", topic)),
+    topic_label = factor(paste0("Topic ", topic_num), levels = paste0("Topic ", 0:13))
+  )
+
+facet_graph_gn <- ggplot(all_plot_df_gn, aes(x = period, y = estimate, group = outlet, color = outlet)) +
+  geom_line(linewidth = 1, alpha = 0.85) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+  geom_point(size = 2.5) +
+  scale_color_manual(
+    name = "Outlet",
+    values = c(Guardian = "#B22222", NYTimes = "#1B4F72"),
+    labels = c(Guardian = "The Guardian", NYTimes = "The New York Times")
+  ) +
+  scale_x_discrete(limits = c("Pre", "Post"),
+                    labels = c(Pre = "Pre", Post = "Post")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ topic_label, scales = "free", ncol = 4) +
+  labs(
+    title = "Topic coverage: The Guardian vs New York Times",
+    subtitle = "Topic proportion, pre vs post ChatGPT launch (Nov 2022)",
+    x = NULL, y = "Share of Mentions across Articles"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "top",
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(size = 8)
+  )
+
+facet_graph_gn
+```
+
+
+```{r}
+
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(sandwich)
+library(lmtest)
+
+ft_full  <- full_pre_reference |> filter(outlet == "FT")
+wsj_full <- full_pre_reference |> filter(outlet == "WSJ")
+
+check_separation <- function(data, topic_col) {
+  data |>
+    group_by(period) |>
+    summarise(n_nonzero = sum(.data[[topic_col]] > 0, na.rm = TRUE), .groups = "drop") |>
+    pull(n_nonzero) |>
+    min()
+}
+
+separation_flags_fw <- tibble(
+  topic = 0:13,
+  min_nonzero_ft  = sapply(0:13, function(i) check_separation(ft_full, paste0("topic_", i))),
+  min_nonzero_wsj = sapply(0:13, function(i) check_separation(wsj_full, paste0("topic_", i)))
+) |>
+  mutate(
+    needs_lpm_ft  = min_nonzero_ft  <= 2,
+    needs_lpm_wsj = min_nonzero_wsj <= 2
+  )
+
+print(separation_flags_fw)
+
+models_ft  <- list()
+models_wsj <- list()
+
+for (i in 0:13) {
+  f <- as.formula(paste0("topic_", i, " ~ period"))
+
+  use_lpm_ft  <- separation_flags_fw$needs_lpm_ft[separation_flags_fw$topic == i]
+  use_lpm_wsj <- separation_flags_fw$needs_lpm_wsj[separation_flags_fw$topic == i]
+
+  models_ft[[paste0("topic", i, "_ft")]] <- if (use_lpm_ft) {
+    lm(f, data = ft_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = ft_full)
+  }
+
+  models_wsj[[paste0("topic", i, "_wsj")]] <- if (use_lpm_wsj) {
+    lm(f, data = wsj_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = wsj_full)
+  }
+}
+
+
+get_period_estimates <- function(model, outlet_label) {
+  periods <- c("Pre", "Post")
+
+  if (inherits(model, "lm") && !inherits(model, "glm")) {
+    robust_vcov <- vcovHC(model, type = "HC1")
+    b <- coef(model)
+
+    est_pre  <- b[1]
+    est_post <- b[1] + b[2]
+
+    ci_pre <- coefci(model, vcov. = robust_vcov)[1, ]
+
+    data_post_ref <- model$model |>
+      mutate(period = relevel(factor(period), ref = "Post"))
+    f_post <- formula(model)
+    model_post_ref <- lm(f_post, data = data_post_ref)
+    ci_post <- coefci(model_post_ref, vcov. = vcovHC(model_post_ref, type = "HC1"))[1, ]
+
+    tibble(
+      outlet    = outlet_label,
+      period    = periods,
+      estimate  = c(est_pre, est_post),
+      conf.low  = c(ci_pre[1], ci_post[1]),
+      conf.high = c(ci_pre[2], ci_post[2])
+    )
+
+  } else {
+    pred <- predict(model, newdata = data.frame(period = periods),
+                     type = "link", se.fit = TRUE)
+    tibble(
+      outlet    = outlet_label,
+      period    = periods,
+      estimate  = plogis(pred$fit),
+      conf.low  = plogis(pred$fit - 1.96 * pred$se.fit),
+      conf.high = plogis(pred$fit + 1.96 * pred$se.fit)
+    )
+  }
+}
+
+n_df_fw <- bind_rows(
+  ft_full  |> count(period) |> mutate(outlet = "FT"),
+  wsj_full |> count(period) |> mutate(outlet = "WSJ")
+)
+
+topic_graphs_fw   <- list()
+topic_plot_dfs_fw <- list()
+
+for (i in 0:13) {
+  ft_model  <- models_ft[[paste0("topic", i, "_ft")]]
+  wsj_model <- models_wsj[[paste0("topic", i, "_wsj")]]
+
+  if (is.null(ft_model) || is.null(wsj_model)) {
+    warning(paste("Missing model for topic", i, "- skipping"))
+    next
+  }
+
+  plot_df <- bind_rows(
+    get_period_estimates(ft_model, "FT"),
+    get_period_estimates(wsj_model, "WSJ")
+  ) |> left_join(n_df_fw, by = c("period", "outlet"))
+
+  g <- ggplot(plot_df, aes(x = period, y = estimate, group = outlet, color = outlet)) +
+    geom_line(linewidth = 1.3, alpha = 0.85) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+    geom_point(size = 5) +
+    scale_color_manual(
+      name = "Outlet",
+      values = c(FT = "#B22222", WSJ = "#1B4F72"),
+      labels = c(FT = "Financial Times", WSJ = "Wall Street Journal")
+    ) +
+    scale_x_discrete(limits = c("Pre", "Post"),
+                      labels = c(Pre = "Pre-ChatGPT", Post = "Post-ChatGPT")) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = paste0("Topic ", i, " coverage: Financial Times vs Wall Street Journal"),
+      subtitle = "Topic proportion, pre vs post ChatGPT launch (Nov 2022)",
+      x = NULL, y = "Share of Mentions across Articles"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+
+  topic_plot_dfs_fw[[paste0("topic", i)]] <- plot_df
+  topic_graphs_fw[[paste0("topic", i)]]   <- g
+}
+
+
+all_plot_df_fw <- bind_rows(topic_plot_dfs_fw, .id = "topic") |>
+  mutate(
+    period      = factor(period, levels = c("Pre", "Post")),
+    topic_num   = as.integer(gsub("topic", "", topic)),
+    topic_label = factor(paste0("Topic ", topic_num), levels = paste0("Topic ", 0:13))
+  )
+
+facet_graph_fw <- ggplot(all_plot_df_fw, aes(x = period, y = estimate, group = outlet, color = outlet)) +
+  geom_line(linewidth = 1, alpha = 0.85) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+  geom_point(size = 2.5) +
+  scale_color_manual(
+    name = "Outlet",
+    values = c(FT = "#B22222", WSJ = "#1B4F72"),
+    labels = c(FT = "Financial Times", WSJ = "Wall Street Journal")
+  ) +
+  scale_x_discrete(limits = c("Pre", "Post"),
+                    labels = c(Pre = "Pre", Post = "Post")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ topic_label, scales = "free", ncol = 4) +
+  labs(
+    title = "Topic coverage: Financial Times vs Wall Street Journal",
+    subtitle = "Topic proportion, pre vs post ChatGPT launch (Nov 2022)",
+    x = NULL, y = "Share of Mentions across Articles"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "top",
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(size = 8)
+  )
+
+facet_graph_fw
+```
+
+
+```{r}
+separation_flags_fw |> filter(topic %in% c(9, 13))
+```
+
+
+```{r}
+ft_full  |> group_by(period) |> summarise(n = n(), n_nonzero_9 = sum(topic_9 > 0), n_nonzero_13 = sum(topic_13 > 0))
+wsj_full |> group_by(period) |> summarise(n = n(), n_nonzero_9 = sum(topic_9 > 0), n_nonzero_13 = sum(topic_13 > 0))
+```
+
+```{r}
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(sandwich)
+library(lmtest)
+
+sun_full    <- full_pre_reference |> filter(outlet == "Sun")
+npost_full  <- full_pre_reference |> filter(outlet == "NP")
+
+all_years <- sort(unique(as.character(full_pre_reference$year)))
+
+sun_full   <- sun_full   |> mutate(year = factor(as.character(year), levels = all_years))
+npost_full <- npost_full |> mutate(year = factor(as.character(year), levels = all_years))
+
+CUTOFF_YEAR <- "2022"   s
+
+
+CUTOFF_YEAR <- 2022
+
+check_separation <- function(data, topic_col) {
+  data |>
+    group_by(year) |>
+    summarise(n_nonzero = sum(.data[[topic_col]] > 0, na.rm = TRUE), .groups = "drop") |>
+    pull(n_nonzero) |>
+    min()  # smallest nonzero count across all years
+}
+
+separation_flags <- tibble(
+  topic = topic_ids,
+  min_nonzero_sun = sapply(topic_ids, function(i) check_separation(sun_full, paste0("topic_", i))),
+  min_nonzero_np  = sapply(topic_ids, function(i) check_separation(npost_full, paste0("topic_", i)))
+) |>
+  mutate(
+    needs_lpm_sun = min_nonzero_sun <= 2,
+    needs_lpm_np  = min_nonzero_np  <= 2
+  )
+
+print(separation_flags)
+
+
+models_sun <- list()
+models_np  <- list()
+
+for (i in topic_ids) {
+  f <- as.formula(paste0("topic_", i, " ~ year"))
+
+  use_lpm_sun <- separation_flags$needs_lpm_sun[separation_flags$topic == i]
+  use_lpm_np  <- separation_flags$needs_lpm_np[separation_flags$topic == i]
+
+  models_sun[[paste0("topic", i, "_sun")]] <- if (use_lpm_sun) {
+    lm(f, data = sun_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = sun_full)
+  }
+
+  models_np[[paste0("topic", i, "_np")]] <- if (use_lpm_np) {
+    lm(f, data = npost_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = npost_full)
+  }
+}
+
+
+
+get_year_estimates <- function(model, outlet_label, years) {
+
+  year_levels <- as.character(years)          # e.g. "2020".."2025"
+  newdata <- data.frame(year = factor(year_levels, levels = year_levels))
+
+  if (inherits(model, "lm") && !inherits(model, "glm")) {
+    b <- coef(model)
+    Xnew_full <- model.matrix(~ year, data = newdata, na.action = na.pass)
+    missing_cols <- setdiff(names(b), colnames(Xnew_full))
+    for (mc in missing_cols) Xnew_full <- cbind(Xnew_full, setNames(data.frame(0), mc))
+    Xnew <- as.matrix(Xnew_full[, names(b), drop = FALSE])
+
+    est <- as.vector(Xnew %*% b)
+    V   <- vcovHC(model, type = "HC1")
+    se  <- sqrt(rowSums((Xnew %*% V) * Xnew))
+
+    tibble(
+      outlet    = outlet_label,
+      year      = factor(year_levels, levels = year_levels),   # <- factor, not integer
+      estimate  = est,
+      conf.low  = est - 1.96 * se,
+      conf.high = est + 1.96 * se
+    )
+
+  } else {
+    pred <- predict(model, newdata = newdata, type = "link",
+                     se.fit = TRUE, na.action = na.pass)
+
+    tibble(
+      outlet    = outlet_label,
+      year      = factor(year_levels, levels = year_levels),   # <- factor, not integer
+      estimate  = plogis(pred$fit),
+      conf.low  = plogis(pred$fit - 1.96 * pred$se.fit),
+      conf.high = plogis(pred$fit + 1.96 * pred$se.fit)
+    )
+  }
+}
+
+n_df <- bind_rows(
+  sun_full   |> count(year) |> mutate(outlet = "Sun"),
+  npost_full |> count(year) |> mutate(outlet = "NP")
+)
+
+topic_graphs   <- list()
+topic_plot_dfs <- list()
+
+for (i in topic_ids) {
+  sun_model   <- models_sun[[paste0("topic", i, "_sun")]]
+  npost_model <- models_np[[paste0("topic", i, "_np")]]
+
+  if (is.null(sun_model) || is.null(npost_model)) {
+    warning(paste("Missing model for topic", i, "- skipping"))
+    next
+  }
+
+  plot_df <- bind_rows(
+    get_year_estimates(sun_model, "Sun", all_years),
+    get_year_estimates(npost_model, "NP", all_years)
+  ) |> left_join(n_df, by = c("year", "outlet"))
+
+  g <- ggplot(plot_df, aes(x = year, y = estimate, group = outlet, color = outlet)) +
+    geom_vline(xintercept = which(all_years == CUTOFF_YEAR) + 0.5,
+               linetype = "dashed", color = "grey40", linewidth = 0.6) +
+    geom_line(linewidth = 1.3, alpha = 0.85) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+    geom_point(size = 5) +
+    scale_color_manual(
+      name = "Outlet",
+      values = c(Sun = "#B22222", NP = "#1B4F72"),
+      breaks = c("Sun", "NP"),                                    # <- controls legend order
+  labels = c(Sun = "The Sun", NP = "The New York Post")
+    ) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = paste0("Topic ", i, " coverage: The Sun vs New York Post"),
+      subtitle = "Topic proportion by year (dashed line = ChatGPT launch, Nov 2022)",
+      x = NULL, y = "Share of Mentions across Articles"
+    ) +
+    theme_minimal(base_size = 16) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+
+  topic_plot_dfs[[paste0("topic", i)]] <- plot_df
+  topic_graphs[[paste0("topic", i)]]   <- g
+}
+
+
+all_plot_df <- bind_rows(topic_plot_dfs, .id = "topic") |>
+  mutate(
+    year        = factor(year, levels = all_years),
+    topic_num   = as.integer(gsub("topic", "", topic)),
+    topic_label = factor(paste0("Topic ", topic_num), levels = paste0("Topic ", topic_ids))
+  )
+
+facet_sun <- ggplot(all_plot_df, aes(x = year, y = estimate, group = outlet, color = outlet)) +
+  geom_vline(xintercept = which(all_years == CUTOFF_YEAR) + 0.5,
+             linetype = "dashed", color = "grey40", linewidth = 0.5) +
+  geom_line(linewidth = 1, alpha = 0.85) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+  geom_point(size = 2.5) +
+  scale_color_manual(
+    name = "Outlet",
+    values = c(Sun = "#B22222", NP = "#1B4F72"),
+  breaks = c("Sun", "NP"),                                    # <- controls legend order
+  labels = c(Sun = "The Sun", NP = "The New York Post")
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ topic_label, scales = "free", ncol = 4) +
+  labs(
+    title = "Topic coverage: The Sun vs New York Post",
+    subtitle = "Topic proportion by year (dashed line = ChatGPT launch, Nov 2022)",
+    x = NULL, y = "Share of Mentions across Articles"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "top",
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(size = 8, angle = 45, hjust = 1)
+  )
+
+facet_sun
+
+n_topics <- length(topic_ids)
+n_cols   <- 4
+n_rows   <- ceiling(n_topics / n_cols)
+
+```
+
+```{r}
+
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(sandwich)
+library(lmtest)
+
+nyt_full      <- full_pre_reference |> filter(outlet == "NYTimes")
+guardian_full <- full_pre_reference |> filter(outlet == "Guardian")
+
+
+
+all_years <- sort(unique(as.character(full_pre_reference$year)))
+
+nyt_full      <- full_pre_reference |> filter(outlet == "NYTimes") |>
+  mutate(year = factor(as.character(year), levels = all_years))
+
+guardian_full <- full_pre_reference |> filter(outlet == "Guardian") |>
+  mutate(year = factor(as.character(year), levels = all_years))
+
+
+
+CUTOFF_YEAR <- "2022"
+
+topic_cols <- grep("^topic_[0-9]+$", names(full_pre_reference), value = TRUE)
+topic_ids  <- sort(as.integer(gsub("^topic_", "", topic_cols)))
+
+rm(models_nyt, models_guardian, separation_flags, topic_plot_dfs, topic_graphs)
+
+separation_flags <- tibble(
+  topic = topic_ids,
+  min_nonzero_nyt      = sapply(topic_ids, function(i) check_separation(nyt_full, paste0("topic_", i))),
+  min_nonzero_guardian = sapply(topic_ids, function(i) check_separation(guardian_full, paste0("topic_", i)))
+) |>
+  mutate(
+    needs_lpm_nyt      = min_nonzero_nyt      <= 2,
+    needs_lpm_guardian = min_nonzero_guardian <= 2
+  )
+
+
+models_nyt      <- list()
+models_guardian <- list()
+
+for (i in topic_ids) {
+  f <- as.formula(paste0("topic_", i, " ~ year"))
+
+  use_lpm_nyt      <- separation_flags$needs_lpm_nyt[separation_flags$topic == i]
+  use_lpm_guardian <- separation_flags$needs_lpm_guardian[separation_flags$topic == i]
+
+  models_nyt[[paste0("topic", i, "_nyt")]] <- if (use_lpm_nyt) {
+    lm(f, data = nyt_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = nyt_full)
+  }
+
+  models_guardian[[paste0("topic", i, "_guardian")]] <- if (use_lpm_guardian) {
+    lm(f, data = guardian_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = guardian_full)
+  }
+}
+
+
+
+get_year_estimates <- function(model, outlet_label, years) {
+
+  year_levels <- as.character(years)
+
+
+  model_years <- if (inherits(model, "lm") && !inherits(model, "glm")) {
+    levels(droplevels(model$model$year))
+  } else {
+    model$xlevels$year
+  }
+
+  usable_years   <- intersect(year_levels, model_years)
+  unusable_years <- setdiff(year_levels, model_years)   # e.g. "2019" for NYT
+
+  newdata <- data.frame(year = factor(usable_years, levels = model_years))
+
+  if (inherits(model, "lm") && !inherits(model, "glm")) {
+    b <- coef(model)
+    Xnew_full <- model.matrix(~ year, data = newdata, na.action = na.pass)
+    missing_cols <- setdiff(names(b), colnames(Xnew_full))
+    for (mc in missing_cols) Xnew_full <- cbind(Xnew_full, setNames(data.frame(0), mc))
+    Xnew <- as.matrix(Xnew_full[, names(b), drop = FALSE])
+
+    est <- as.vector(Xnew %*% b)
+    V   <- vcovHC(model, type = "HC1")
+    se  <- sqrt(rowSums((Xnew %*% V) * Xnew))
+
+    est_df <- tibble(year = usable_years, estimate = est,
+                      conf.low = est - 1.96 * se, conf.high = est + 1.96 * se)
+
+  } else {
+    pred <- predict(model, newdata = newdata, type = "link", se.fit = TRUE)
+    est_df <- tibble(
+      year      = usable_years,
+      estimate  = plogis(pred$fit),
+      conf.low  = plogis(pred$fit - 1.96 * pred$se.fit),
+      conf.high = plogis(pred$fit + 1.96 * pred$se.fit)
+    )
+  }
+
+  na_df <- tibble(year = unusable_years, estimate = NA_real_,
+                   conf.low = NA_real_, conf.high = NA_real_)
+
+  bind_rows(est_df, na_df) |>
+    mutate(outlet = outlet_label, year = factor(year, levels = year_levels)) |>
+    arrange(year) |>
+    relocate(outlet, year)
+}
+
+n_df <- bind_rows(
+  nyt_full      |> count(year) |> mutate(outlet = "NYT"),
+  guardian_full |> count(year) |> mutate(outlet = "Guardian")
+)
+
+topic_graphs   <- list()
+topic_plot_dfs <- list()
+
+for (i in topic_ids) {
+  nyt_model      <- models_nyt[[paste0("topic", i, "_nyt")]]
+  guardian_model <- models_guardian[[paste0("topic", i, "_guardian")]]
+
+  if (is.null(nyt_model) || is.null(guardian_model)) {
+    warning(paste("Missing model for topic", i, "- skipping"))
+    next
+  }
+
+  plot_df <- bind_rows(
+    get_year_estimates(nyt_model, "NYT", all_years),
+    get_year_estimates(guardian_model, "Guardian", all_years)
+  ) |> left_join(n_df, by = c("year", "outlet"))
+
+  g <- ggplot(plot_df, aes(x = year, y = estimate, group = outlet, color = outlet)) +
+    geom_vline(xintercept = which(all_years == CUTOFF_YEAR) + 0.5,
+               linetype = "dashed", color = "grey40", linewidth = 0.6) +
+    geom_line(linewidth = 1.3, alpha = 0.85) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+    geom_point(size = 5) +
+    scale_color_manual(
+      name = "Outlet",
+      values = c(NYT = "#1B4F72", Guardian = "#B22222"),
+      labels = c(NYT = "The New York Times", Guardian = "The Guardian")
+    ) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = paste0("Topic ", i, " coverage: New York Times vs The Guardian"),
+      subtitle = "Topic proportion by year (dashed line = ChatGPT launch, Nov 2022)",
+      x = NULL, y = "Share of Mentions across Articles"
+    ) +
+    theme_minimal(base_size = 16) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+
+  topic_plot_dfs[[paste0("topic", i)]] <- plot_df
+  topic_graphs[[paste0("topic", i)]]   <- g
+}
+
+
+all_plot_df <- bind_rows(topic_plot_dfs, .id = "topic") |>
+  mutate(
+    year        = factor(year, levels = all_years),
+    topic_num   = as.integer(gsub("topic", "", topic)),
+    topic_label = factor(paste0("Topic ", topic_num), levels = paste0("Topic ", topic_ids))
+  ) 
+
+facet_nyt_guardian <- ggplot(all_plot_df, aes(x = year, y = estimate, group = outlet, color = outlet)) +
+  geom_vline(xintercept = which(all_years == CUTOFF_YEAR) + 0.5,
+             linetype = "dashed", color = "grey40", linewidth = 0.5) +
+  geom_line(linewidth = 1, alpha = 0.85) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+  geom_point(size = 2.5) +
+  scale_color_manual(
+    name = "Outlet",
+    values = c(NYT = "#1B4F72", Guardian = "#B22222"),
+    labels = c(NYT = "The New York Times", Guardian = "The Guardian")
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ topic_label, scales = "free", ncol = 4) +
+  labs(
+    title = "Topic coverage: New York Times vs The Guardian",
+    subtitle = "Topic proportion by year (dashed line = ChatGPT launch, Nov 2022)",
+    x = NULL, y = "Share of Mentions across Articles"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "top",
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(size = 8, angle = 45, hjust = 1)
+  )
+
+facet_nyt_guardian
+
+n_topics <- length(topic_ids)
+n_cols   <- 4
+n_rows   <- ceiling(n_topics / n_cols)
+
+```
+
+```{r}
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(sandwich)
+library(lmtest)
+
+ft_full  <- full_pre_reference |> filter(outlet == "FT")
+wsj_full <- full_pre_reference |> filter(outlet == "WSJ")
+
+all_years <- sort(unique(as.character(full_pre_reference$year)))
+
+ft_full  <- ft_full  |> mutate(year = factor(as.character(year), levels = all_years))
+wsj_full <- wsj_full |> mutate(year = factor(as.character(year), levels = all_years))
+
+## Sanity check 
+full_pre_reference |> filter(outlet %in% c("FT", "WSJ")) |> count(outlet, year)
+
+CUTOFF_YEAR <- "2022"
+
+topic_cols <- grep("^topic_[0-9]+$", names(full_pre_reference), value = TRUE)
+topic_ids  <- sort(as.integer(gsub("^topic_", "", topic_cols)))
+
+
+check_separation <- function(data, topic_col) {
+  data |>
+    group_by(year) |>
+    summarise(n_nonzero = sum(.data[[topic_col]] > 0, na.rm = TRUE), .groups = "drop") |>
+    pull(n_nonzero) |>
+    min()
+}
+
+separation_flags <- tibble(
+  topic = topic_ids,
+  min_nonzero_ft  = sapply(topic_ids, function(i) check_separation(ft_full, paste0("topic_", i))),
+  min_nonzero_wsj = sapply(topic_ids, function(i) check_separation(wsj_full, paste0("topic_", i)))
+) |>
+  mutate(
+    needs_lpm_ft  = min_nonzero_ft  <= 2,
+    needs_lpm_wsj = min_nonzero_wsj <= 2
+  )
+
+print(separation_flags)
+
+
+models_ft  <- list()
+models_wsj <- list()
+
+for (i in topic_ids) {
+  f <- as.formula(paste0("topic_", i, " ~ year"))
+
+  use_lpm_ft  <- separation_flags$needs_lpm_ft[separation_flags$topic == i]
+  use_lpm_wsj <- separation_flags$needs_lpm_wsj[separation_flags$topic == i]
+
+  models_ft[[paste0("topic", i, "_ft")]] <- if (use_lpm_ft) {
+    lm(f, data = ft_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = ft_full)
+  }
+
+  models_wsj[[paste0("topic", i, "_wsj")]] <- if (use_lpm_wsj) {
+    lm(f, data = wsj_full)
+  } else {
+    glm(f, family = quasibinomial(link = "logit"), data = wsj_full)
+  }
+}
+
+
+
+get_year_estimates <- function(model, outlet_label, years) {
+
+  year_levels <- as.character(years)
+
+  ## Which years does this model's OWN data actually contain?
+  model_years <- if (inherits(model, "lm") && !inherits(model, "glm")) {
+    levels(droplevels(model$model$year))
+  } else {
+    model$xlevels$year
+  }
+
+  usable_years   <- intersect(year_levels, model_years)
+  unusable_years <- setdiff(year_levels, model_years)
+
+  newdata <- data.frame(year = factor(usable_years, levels = model_years))
+
+  if (inherits(model, "lm") && !inherits(model, "glm")) {
+    b <- coef(model)
+    Xnew_full <- model.matrix(~ year, data = newdata, na.action = na.pass)
+    missing_cols <- setdiff(names(b), colnames(Xnew_full))
+    for (mc in missing_cols) Xnew_full <- cbind(Xnew_full, setNames(data.frame(0), mc))
+    Xnew <- as.matrix(Xnew_full[, names(b), drop = FALSE])
+
+    est <- as.vector(Xnew %*% b)
+    V   <- vcovHC(model, type = "HC1")
+    se  <- sqrt(rowSums((Xnew %*% V) * Xnew))
+
+    est_df <- tibble(year = usable_years, estimate = est,
+                      conf.low = est - 1.96 * se, conf.high = est + 1.96 * se)
+
+  } else {
+    pred <- predict(model, newdata = newdata, type = "link", se.fit = TRUE)
+    est_df <- tibble(
+      year      = usable_years,
+      estimate  = plogis(pred$fit),
+      conf.low  = plogis(pred$fit - 1.96 * pred$se.fit),
+      conf.high = plogis(pred$fit + 1.96 * pred$se.fit)
+    )
+  }
+
+  na_df <- tibble(year = unusable_years, estimate = NA_real_,
+                   conf.low = NA_real_, conf.high = NA_real_)
+
+  bind_rows(est_df, na_df) |>
+    mutate(outlet = outlet_label, year = factor(year, levels = year_levels)) |>
+    arrange(year) |>
+    relocate(outlet, year)
+}
+
+n_df <- bind_rows(
+  ft_full  |> count(year) |> mutate(outlet = "FT"),
+  wsj_full |> count(year) |> mutate(outlet = "WSJ")
+)
+
+topic_graphs   <- list()
+topic_plot_dfs <- list()
+
+for (i in topic_ids) {
+  ft_model  <- models_ft[[paste0("topic", i, "_ft")]]
+  wsj_model <- models_wsj[[paste0("topic", i, "_wsj")]]
+
+  if (is.null(ft_model) || is.null(wsj_model)) {
+    warning(paste("Missing model for topic", i, "- skipping"))
+    next
+  }
+
+  plot_df <- bind_rows(
+    get_year_estimates(ft_model, "FT", all_years),
+    get_year_estimates(wsj_model, "WSJ", all_years)
+  ) |> left_join(n_df, by = c("year", "outlet"))
+
+  g <- ggplot(plot_df, aes(x = year, y = estimate, group = outlet, color = outlet)) +
+    geom_vline(xintercept = which(all_years == CUTOFF_YEAR) + 0.5,
+               linetype = "dashed", color = "grey40", linewidth = 0.6) +
+    geom_line(linewidth = 1.3, alpha = 0.85) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+    geom_point(size = 5) +
+    scale_color_manual(
+      name = "Outlet",
+      values = c(FT = "#B22222", WSJ = "#1B4F72"),
+      labels = c(FT = "Financial Times", WSJ = "Wall Street Journal")
+    ) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = paste0("Topic ", i, " coverage: FT vs Wall Street Journal"),
+      subtitle = "Topic proportion by year (dashed line = ChatGPT launch, Nov 2022)",
+      x = NULL, y = "Share of Mentions across Articles"
+    ) +
+    theme_minimal(base_size = 16) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+
+  topic_plot_dfs[[paste0("topic", i)]] <- plot_df
+  topic_graphs[[paste0("topic", i)]]   <- g
+}
+
+
+all_plot_df <- bind_rows(topic_plot_dfs, .id = "topic") |>
+  mutate(
+    year        = factor(year, levels = all_years),
+    topic_num   = as.integer(gsub("topic", "", topic)),
+    topic_label = factor(paste0("Topic ", topic_num), levels = paste0("Topic ", topic_ids)),
+    conf.low = pmax(conf.low, 0))
+
+facet_ft_wsj <- ggplot(all_plot_df, aes(x = year, y = estimate, group = outlet, color = outlet)) +
+  geom_vline(xintercept = which(all_years == CUTOFF_YEAR) + 0.5,
+             linetype = "dashed", color = "grey40", linewidth = 0.5) +
+  geom_line(linewidth = 1, alpha = 0.85) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.05) +
+  geom_point(size = 2.5) +
+  scale_color_manual(
+    name = "Outlet",
+    values = c(FT = "#B22222", WSJ = "#1B4F72"),   # note: darker gold, not FT's pale pink, for legibility
+    labels = c(FT = "Financial Times", WSJ = "Wall Street Journal")
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ topic_label, scales = "free", ncol = 4) +
+  labs(
+    title = "Topic coverage: Financial Times vs Wall Street Journal",
+    subtitle = "Topic proportion by year (dashed line = ChatGPT launch, Nov 2022)",
+    x = NULL, y = "Share of Mentions across Articles"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "top",
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(size = 8, angle = 45, hjust = 1)
+  )
+
+facet_ft_wsj
+
+n_topics <- length(topic_ids)
+n_cols   <- 4
+n_rows   <- ceiling(n_topics / n_cols)
+
+
+```
+
+## Word Representations 
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(readr)
+library(kableExtra)
+
+
+topic_cols <- grep("^topic_[0-9]+$", names(article_df), value = TRUE)
+topic_ids  <- sort(as.integer(gsub("^topic_", "", topic_cols)))
+
+topic_info <- topic_info |>
+  mutate(
+    topic = Topic,
+    label = str_remove(Name, paste0("^", Topic, "_"))   # strips "17_" prefix -> "Trump's Trade Tariffs"
+  ) |>
+  select(topic, label)
+
+get_top_headlines <- function(topic_id, data, n = 3) {
+  col <- paste0("topic_", topic_id)
+
+  data |>
+    select(headline, proportion = all_of(col)) |>
+    filter(proportion > 0) |>
+    arrange(desc(proportion)) |>
+    slice_head(n = n) |>
+    mutate(topic = topic_id, rank = row_number()) |>
+    select(topic, rank, headline, proportion)
+}
+
+headline_examples <- map_dfr(topic_ids, get_top_headlines, data = article_df, n = 3)
+
+
+
+headline_table <- headline_examples |>
+  left_join(topic_info, by = "topic") |>
+  select(topic, label, rank, headline, proportion) |>
+  arrange(topic, rank)
+
+## Sanity check 
+headline_table |> filter(is.na(label)) |> distinct(topic)
+
+## Sanity check on a couple of topics
+headline_table |> filter(topic %in% c(0, 17)) |> print(n = Inf)
+
+
+
+headline_table_wide <- headline_table |>
+  pivot_wider(
+    id_cols = c(topic, label),
+    names_from = rank,
+    values_from = headline,
+    names_prefix = "headline_"
+  ) |>
+  arrange(topic)
+
+print(headline_table_wide, n = Inf, width = Inf)
+
+
+headline_table_wide |>
+  mutate(topic = paste0("Topic ", topic)) |>
+  kable(
+    format = "latex",
+    col.names = c("Topic", "Label", "Headline 1", "Headline 2", "Headline 3"),
+    caption = "Topic labels with representative headlines",
+    booktabs = TRUE,
+    longtable = TRUE
+  ) |>
+  kable_styling(latex_options = c("striped", "repeat_header"), font_size = 9) |>
+  column_spec(3:5, width = "4.5cm")
+```
+
+## Heatmap 
+
+```{r}
+library(ggplot2)
+
+heatmap = ggplot(summary_means_long, aes(x = period, y = factor(topic_num, levels = rev(sort(unique(topic_num)))), 
+                                 fill = mean_proportion)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  facet_wrap(~ outlet, nrow = 1) +
+  scale_fill_gradient(
+  low = "white", high = "#7A0000",
+  trans = "sqrt", 
+  labels = scales::percent_format(accuracy = 1)
+)+
+  labs(x = NULL, y = "Topic", fill = "Mean\nproportion",
+       title = "Mean Topic Proportion by Outlet and Period") +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 0)
+  )
+```

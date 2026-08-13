@@ -1,0 +1,458 @@
+## This file contains the code used to construct the corpus. Further down in the script is code written to perform basic exploration of the data, none of which is included in the final paper. 
+
+```{r}
+library("dplyr")
+library(quanteda)
+library(readtext)
+library(stringr)
+library("quanteda.textstats")
+library(purrr)
+library(rsvd)
+library(Rtsne)
+library(geometry)
+library(stm)
+```
+
+# PROCESS THE RAW TXT FILES
+```{r}
+# Build an ARTICLE-LEVEL corpus from Factiva .txt exports
+
+data_path <- "/Users/imanfq/Desktop/ASDS/Dissertation/data"
+
+files <- list.files(data_path, pattern = "\\.txt$",
+                    recursive = TRUE, full.names = TRUE)
+rt <- readtext(files, encoding = "UTF-8")   
+
+rel    <- sub(paste0("^", data_path, "/"), "", files)   
+parts  <- strsplit(rel, "/")
+f_country <- vapply(parts, `[`, character(1), 1)         
+f_period  <- vapply(parts, `[`, character(1), 2)         
+folder    <- vapply(parts, `[`, character(1), 3)         
+f_outlet  <- sub("(Pre|Post)$", "", folder)              
+
+FACTIVA_ID <- "Document [A-Z0-9]{2,12}20[0-9]{6}[a-z0-9]{3,}"
+DOC_LINE   <- paste0("(\\r?\\n", FACTIVA_ID, ")(?=\\r?\\n|$)")
+
+split_articles <- function(txt) {
+  marked <- str_replace_all(txt, DOC_LINE, "\\1<<<SPLIT>>>")
+  pcs <- str_split(marked, fixed("<<<SPLIT>>>"))[[1]]
+  pcs <- str_trim(pcs)
+  pcs[str_detect(pcs, FACTIVA_ID)]
+}
+
+art_list <- Map(function(txt, ctry, per, out, src) {
+  pcs <- split_articles(txt)
+  if (length(pcs) == 0) return(NULL)
+  data.frame(
+    text       = pcs,
+    country    = ctry,
+    period     = per,
+    outlet     = out,
+    srcfile    = src,
+    article_n  = seq_along(pcs),
+    factiva_id = str_match(pcs, "Document ([A-Z0-9]{2,12}20[0-9]{6}[a-z0-9]{3,})")[, 2],
+    stringsAsFactors = FALSE
+  )
+}, rt$text, f_country, f_period, f_outlet, rel)
+
+names(art_list) <- NULL
+art_df <- do.call(rbind, art_list) 
+rownames(art_df) <- NULL
+
+
+dups <- duplicated(art_df$factiva_id)
+cat("Articles parsed:", nrow(art_df),
+    "| duplicates removed:", sum(dups), "\n")
+art_df <- art_df[!dups, ]
+
+
+art_df$doc_id <- paste(art_df$outlet, art_df$period, art_df$factiva_id, sep = "_")
+```
+
+
+# CLEANING
+
+```{r}
+#Remove copyright block and maintain headline 
+library(stringr)
+
+parse_factiva <- function(txt) {
+  
+  bits   <- str_split(txt, regex("(?:opyright|©)[^\n]*\n", ignore_case = TRUE), n = 2)[[1]]
+  header <- bits[1]
+  body   <- if (length(bits) > 1) bits[2] else ""
+
+
+  pre_wc      <- str_split(header, regex("\n\\s*\\d+\\s+words\\b"), n = 2)[[1]][1]
+  first_block <- str_split(str_trim(pre_wc), regex("\n\\s*\n"))[[1]][1]
+  hl_lines    <- str_split(str_trim(first_block), "\n")[[1]]
+
+  headline    <- if (length(hl_lines) >= 2) str_c(hl_lines[-1], collapse = " ") else hl_lines[1]
+
+  body <- body |>
+    str_remove(regex("(?s)\\s*Document\\s+\\S+\\s*$")) |>   
+    str_squish()
+
+  list(headline = str_squish(headline), body = body)
+}
+
+article_text = art_df$text 
+
+parsed <- purrr::map(article_text, parse_factiva)
+
+art_df$headline   <- purrr::map_chr(parsed, "headline")
+art_df$body       <- purrr::map_chr(parsed, "body")
+
+
+
+art_df$year <- as.integer(str_sub(
+  str_match(art_df$factiva_id, "20[0-9]{6}")[, 1], 1, 4
+))
+
+
+art_df$year_text <- as.integer(str_extract(art_df$text, "\\b(19|20)\\d{2}\\b"))
+art_df$year_mismatch <- art_df$year != art_df$year_text & !is.na(art_df$year_text)
+
+cat("Rows missing a year in raw text:", sum(is.na(art_df$year_text)), "\n")
+cat("Rows where accession year vs text year disagree:", sum(art_df$year_mismatch, na.rm = TRUE), "\n")
+
+
+art_df$years_since_chatgpt <- art_df$year - 2022
+
+protect_countries <- function(x) {
+  x <- str_replace_all(x, "\\bUnited States\\b", "USCOUNTRY")
+  x <- str_replace_all(x, "\\bU\\.S\\.A\\.?",     "USCOUNTRY")
+  x <- str_replace_all(x, "\\bU\\.S\\.",          "USCOUNTRY")
+  x <- str_replace_all(x, "\\bUSA\\b",            "USCOUNTRY")
+  x <- str_replace_all(x, "\\bUS\\b",             "USCOUNTRY")
+  x <- str_replace_all(x, "\\bUnited Kingdom\\b", "UKCOUNTRY")
+  x <- str_replace_all(x, "\\bU\\.K\\.",          "UKCOUNTRY")
+  x <- str_replace_all(x, "\\bUK\\b",             "UKCOUNTRY")
+  x
+}
+
+art_df$text_clean <- protect_countries(str_c(art_df$headline, art_df$body, sep = ". "))
+```
+
+```{r}
+art_df <- art_df |>
+  select(-year_text, -year_mismatch)
+```
+
+```{r}
+bar_dat = art_df |> group_by(period, outlet) |> summarise(count = n())
+
+bar_dat %>%
+   mutate(
+     outlet = factor(outlet,
+                     levels = c("FT", "Guardian", "Sun",
+                               "WSJ", "NYTimes", "NP")),
+     period = factor(period, levels = c("Pre", "Post"))
+   ) %>%
+   ggplot(aes(x = outlet, y = count, fill = period)) +
+   geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+   geom_text(aes(label = count),
+             position = position_dodge(width = 0.8),
+             vjust = -0.4, size = 3) +
+   scale_fill_manual(values = c("Pre" = "grey65", "Post" = "steelblue4")) +
+   labs(
+     title = "Article Volume by Outlet, Before and After ChatGPT's Release",
+     subtitle = "UK outlets (FT, Guardian, Sun) and US outlets (WSJ, NYTimes, NY Post)",
+     x = NULL, y = "Number of articles", fill = "Period"
+   ) +
+   theme_minimal(base_size = 11) +
+   theme(
+     panel.grid.major.x = element_blank(),
+     legend.position = "top"
+   )
+```
+
+
+# CONVERT TO CORPUS
+```{r}
+# CORPUS
+full_corp <- art_df |> select(doc_id, text_clean, headline, body, country, period, outlet, factiva_id, srcfile) |>
+  corpus(text_field = "text_clean", docid_field = "doc_id")
+```
+
+# TOKENIZE AND REMOVE STOPWORDS AND STEM
+
+```{r}
+#solving for collocations and then tokenizing and removing stop words and stemming
+sw <- stopwords("english")
+
+toks_coll <- full_corp |>
+  tokens(remove_punct = TRUE, remove_symbols = TRUE, remove_numbers = TRUE) |>
+  tokens_tolower()
+
+edge_stop <- function(x) {
+  w <- strsplit(x, " ")[[1]]
+  w[1] %in% sw || w[length(w)] %in% sw
+}
+```
+
+```{r}
+colls <- textstat_collocations(toks_coll, size = 2:3, min_count = 25)
+keep  <- colls[colls$lambda > 5 & !vapply(colls$collocation, edge_stop, logical(1)), ]
+keep <- keep[order(-lengths(strsplit(keep$collocation, " "))), ]   # longest first
+
+nrow(keep)   
+```
+
+```{r}
+extra_stops <- c("said", "say", "says", "told", "according",
+                 "use", "can", "one") 
+
+full_tokenization <- toks_coll |>
+  tokens_compound(pattern = phrase(keep$collocation), concatenator = "_") |> tokens_remove(extra_stops) |>
+  tokens_remove(stopwords("english"))
+```
+
+
+```{r}
+full_tokenization = readRDS("full_tokenization.rds")
+```
+
+# SUBSET BY COUNTRY AND PERIOD
+```{r}
+uk_pre_toks  <- tokens_subset(full_tokenization, country == "UK" & period == "Pre")
+uk_post_toks  <- tokens_subset(full_tokenization, country == "UK" & period == "Post")
+
+us_pre_toks  <- tokens_subset(full_tokenization, country == "US" & period == "Pre")
+us_post_toks  <- tokens_subset(full_tokenization, country == "US" & period == "Post")
+```
+
+# DFMs
+
+```{r}
+#note: secondlast seminar of my472 has this code 
+dfm_full = full_tokenization |> dfm(tolower = TRUE,
+      remove_padding = FALSE, 
+    verbose = quanteda_options("verbose"))
+
+dfm_ukpre = uk_pre_toks |> dfm(tolower = TRUE, 
+      remove_padding = FALSE, 
+    verbose = quanteda_options("verbose"))
+
+
+dfm_ukpost = uk_post_toks |> dfm(tolower = TRUE,
+      remove_padding = FALSE, 
+    verbose = quanteda_options("verbose"))
+
+
+dfm_uspre = us_pre_toks |> dfm(tolower = TRUE,
+      remove_padding = FALSE, 
+    verbose = quanteda_options("verbose"))
+
+dfm_uspost = us_post_toks |> dfm(tolower = TRUE, 
+      remove_padding = FALSE, 
+    verbose = quanteda_options("verbose"))
+
+```
+
+## Exploratory 
+
+```{r}
+outlet_counts = article_df |> group_by(outlet) |> summarise(count = n())
+print(outlet_counts)
+
+country_period_counts = article_df |> count(country, period, outlet) 
+print(country_period_counts)
+
+country_period_counts_vis = article_df %>%
+  count(country, period, outlet) %>%
+  mutate(period = factor(period, levels = c("Pre", "Post"))) %>%
+  ggplot(aes(x = outlet, y = n, fill = period)) +
+  geom_col(position = "dodge") +
+  scale_y_log10() +
+  facet_wrap(~country, scales = "free_x") +
+  labs(y = "Number of Articles", x = NULL) +
+  theme_minimal()
+
+library(dplyr)
+library(tidyr)
+
+pct_change <- country_period_counts |>
+  pivot_wider(names_from = period, values_from = n) |>
+  mutate(
+    log_ratio  = log(Post / Pre)
+  )
+
+country_period_pct_vis = pct_change %>%
+  ggplot(aes(x = outlet, y = log_ratio)) +
+  geom_col(position = "dodge") +
+  scale_y_log10() +
+  facet_wrap(~country, scales = "free_x") +
+  labs(y = "Number of Articles", x = NULL) +
+  theme_minimal()
+
+print(country_period_pct_vis)
+```
+
+
+```{r}
+#| eval: false
+
+#convert to corpus object 
+
+full_corp <- article_df |> select(doc_id, text_clean, headline, body, country, period, outlet, factiva_id, srcfile) |>
+  corpus(text_field = "text_clean", docid_field = "doc_id")
+
+
+sw <- stopwords("english")
+
+toks_coll <- full_corp |>
+  tokens(remove_punct = TRUE, remove_symbols = TRUE, remove_numbers = TRUE) |>
+  tokens_tolower()
+
+edge_stop <- function(x) {
+  w <- strsplit(x, " ")[[1]]
+  w[1] %in% sw || w[length(w)] %in% sw
+}
+
+colls <- textstat_collocations(toks_coll, size = 2:3, min_count = 25)
+keep  <- colls[colls$lambda > 5 & !vapply(colls$collocation, edge_stop, logical(1)), ]
+keep <- keep[order(-lengths(strsplit(keep$collocation, " "))), ]   # longest first  
+
+extra_stops <- c("said", "say", "says", "told", "according",
+                 "use", "can", "one") 
+
+full_tokenization <- toks_coll |>
+  tokens_compound(pattern = phrase(keep$collocation), concatenator = "_") |> tokens_remove(extra_stops) |>
+  tokens_remove(stopwords("english")) |> tokens_remove(pattern = c("a.i", "AI", "artificial_intelligence"), valuetype = "fixed", case_insensitive = TRUE)
+
+docvars(full_tokenization, "lang") <- cld2::detect_language(sapply(as.list(full_tokenization), paste, collapse = " "))
+full_tokenization_en <- tokens_subset(full_tokenization, lang == "en" | is.na(lang)) 
+```
+
+```{r}
+full_tokenization_en = readRDS("")
+```
+
+
+```{r}
+
+ft_pre_toks        <- tokens_subset(full_tokenization_en, country == "UK" & outlet == "FT"       & period == "Pre")
+ft_post_toks       <- tokens_subset(full_tokenization_en, country == "UK" & outlet == "FT"       & period == "Post")
+
+guardian_pre_toks  <- tokens_subset(full_tokenization_en, country == "UK" & outlet == "Guardian" & period == "Pre")
+guardian_post_toks <- tokens_subset(full_tokenization_en, country == "UK" & outlet == "Guardian" & period == "Post")
+
+sun_pre_toks       <- tokens_subset(full_tokenization_en, country == "UK" & outlet == "Sun"      & period == "Pre")
+sun_post_toks      <- tokens_subset(full_tokenization_en, country == "UK" & outlet == "Sun"      & period == "Post")
+
+
+np_pre_toks        <- tokens_subset(full_tokenization_en, country == "US" & outlet == "NP"       & period == "Pre")
+np_post_toks       <- tokens_subset(full_tokenization_en, country == "US" & outlet == "NP"       & period == "Post")
+
+nytimes_pre_toks   <- tokens_subset(full_tokenization_en, country == "US" & outlet == "NYTimes"  & period == "Pre")
+nytimes_post_toks  <- tokens_subset(full_tokenization_en, country == "US" & outlet == "NYTimes"  & period == "Post")
+
+wsj_pre_toks       <- tokens_subset(full_tokenization_en, country == "US" & outlet == "WSJ"      & period == "Pre")
+wsj_post_toks      <- tokens_subset(full_tokenization_en, country == "US" & outlet == "WSJ"      & period == "Post")
+```
+
+## Word Clouds 
+
+## WSJ vs FT
+```{r}
+library(quanteda.textplots)
+wsj_pre_toks |> dfm(tolower = TRUE, # yes, we want to lower case every token!
+      remove_padding = FALSE, # keep default, but doesn't matter since we didn't add padding when tokenizing
+    verbose = quanteda_options("verbose")) |> # keep default
+      #color is for least to most frequent
+   textplot_wordcloud(max_words = 50, color = c("red", "darkgreen", "blue")); title("WSJ: Pre")
+```
+
+```{r}
+wsj_post_toks |> dfm(tolower = TRUE, # yes, we want to lower case every token!
+      remove_padding = FALSE, # keep default, but doesn't matter since we didn't add padding when tokenizing
+    verbose = quanteda_options("verbose")) |> # keep default
+      #color is for least to most frequent
+   textplot_wordcloud(max_words = 50, color = c("red", "darkgreen", "blue")); title("WSJ: Post")
+```
+
+```{r}
+ft_pre_toks |> dfm(tolower = TRUE, # yes, we want to lower case every token!
+      remove_padding = FALSE, # keep default, but doesn't matter since we didn't add padding when tokenizing
+    verbose = quanteda_options("verbose")) |> # keep default
+      #color is for least to most frequent
+   textplot_wordcloud(max_words = 50,  color = c("red", "darkgreen", "blue")); title("FT: Pre")
+```
+
+```{r}
+ft_post_toks |> dfm(tolower = TRUE, # yes, we want to lower case every token!
+      remove_padding = FALSE, # keep default, but doesn't matter since we didn't add padding when tokenizing
+    verbose = quanteda_options("verbose")) |> # keep default
+      #color is for least to most frequent
+   textplot_wordcloud(max_words = 50, color = c("red", "darkgreen", "blue")); title("FT: Post")
+```
+
+# CLOUDS FOR UK AND US TIMES
+```{r}
+library(quanteda.textplots)
+us_pre_toks |> dfm(tolower = TRUE, 
+      remove_padding = FALSE,
+    verbose = quanteda_options("verbose")) |> 
+   textplot_wordcloud(); title("US — Pre")
+
+us_post_toks |> dfm(tolower = TRUE, 
+      remove_padding = FALSE,
+    verbose = quanteda_options("verbose")) |> 
+   textplot_wordcloud(); title("US — Post")
+
+uk_pre_toks |> dfm(tolower = TRUE,
+      remove_padding = FALSE, 
+    verbose = quanteda_options("verbose")) |>
+   textplot_wordcloud(); title("UK — Pre") 
+
+uk_post_toks |> dfm(tolower = TRUE, 
+      remove_padding = FALSE, 
+    verbose = quanteda_options("verbose")) |> 
+   textplot_wordcloud(); title("UK — Post")
+
+#Initial thoughts: UK pre has an emphasis on "people" and post had more on "company"
+#us didn't change as much, ChatGPT became more in the headlines
+```
+
+
+# STRUCTURAL TOPIC MODELING: 
+# - Like LDA but also takes into consideration that the articles differ between country and period 
+
+
+```{r}
+dfm_stm <- dfm_full |>
+  dfm_trim(min_docfreq = 0.005, max_docfreq = 0.95, docfreq_type = "prop")
+
+stm_in <- convert(dfm_stm, to = "stm")
+# stm_in$documents, $vocab, $meta — meta carries your docvars
+```
+
+
+```{r}
+set.seed(226)
+fit <- stm::stm(
+  documents  = stm_in$documents,
+  vocab      = stm_in$vocab,
+  K          = 20,                   
+  prevalence = ~ period * country,   
+  data       = stm_in$meta,
+  init.type  = "LDA",         
+  verbose    = TRUE
+)
+
+#Optimize the value of K, find the better value of K 
+```
+
+
+```{r}
+lab <- labelTopics(fit, n = 7)
+
+topic_table <- data.frame(
+Topic = seq_len(nrow(lab$frex)),
+FREX  = apply(lab$frex, 1, paste, collapse = ", "))
+topic_table
+
+#FREX brings up words that are frequent in a particular category but also exclusive to that category
+```
+
