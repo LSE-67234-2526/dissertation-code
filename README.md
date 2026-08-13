@@ -1,5 +1,5 @@
 # dissertation-code
-Hello! This repository contains all the code used for this dissertation. 
+Hello! This repository contains all the code used for the dissertation titled "Release of ChatGPT and the Evolving Narrative of Artificial Intelligence". 
 
 Unfortunately, I have not shared the corpus or dataset due to fears of running into copyright issues. 
 
